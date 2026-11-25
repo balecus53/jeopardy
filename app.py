@@ -95,6 +95,7 @@ def init_state(num_teams=2):
     st.session_state.current = None      # (cat_index, value_index)
     st.session_state.show_answer = False
     st.session_state.wager = None
+    st.session_state.turn = 0            # index of the team whose turn it is
     st.session_state.scores = {i: 0 for i in range(4)}
     st.session_state.daily_double = (
         random.randrange(len(CATEGORIES)),
@@ -118,10 +119,18 @@ with st.sidebar:
     for i in range(num_teams):
         S.team_names[i] = st.text_input(f"Team {i + 1} name", S.team_names[i], key=f"name_{i}")
 
+    turn_rule = st.radio(
+        "Who picks next?",
+        ["Rotate every clue", "Winner keeps control"],
+        key="turn_rule",
+    )
+    S.turn %= num_teams
+
     st.divider()
     st.subheader("Scoreboard")
     for i in range(num_teams):
-        st.metric(S.team_names[i], f"${S.scores[i]:,}")
+        label = f"👉 {S.team_names[i]}" if i == S.turn else S.team_names[i]
+        st.metric(label, f"${S.scores[i]:,}")
 
     st.divider()
     if st.button("🔄 New game", use_container_width=True):
@@ -143,6 +152,11 @@ def resolve(team, correct):
     value = S.wager if S.wager is not None else VALUES[r]
     if team is not None:
         S.scores[team] += value if correct else -value
+    # Pass control: winner keeps it (if that rule is on), otherwise rotate
+    if S.get("turn_rule") == "Winner keeps control" and team is not None and correct:
+        S.turn = team
+    else:
+        S.turn = (S.turn + 1) % num_teams
     S.used.add((c, r))
     S.current = None
     S.show_answer = False
@@ -158,6 +172,7 @@ def reveal():
 # ----------------------------------------------------------------------------
 def show_board():
     st.title("❓ Jeopardy!")
+    st.subheader(f"🎯 {S.team_names[S.turn % num_teams]}, pick a clue")
     cols = st.columns(len(CATEGORIES))
     for c, cat in enumerate(CATEGORIES):
         cols[c].markdown(f'<div class="cat-header">{cat}</div>', unsafe_allow_html=True)
@@ -195,6 +210,7 @@ def show_clue():
         team_options,
         format_func=lambda i: S.team_names[i],
         horizontal=True,
+        index=S.turn % num_teams,
         key=f"answerer_{c}_{r}",
     )
 
