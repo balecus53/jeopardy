@@ -1,10 +1,13 @@
+import base64
 import copy
 import html
+import io
 import json
 import random
 import uuid
 from pathlib import Path
 
+from PIL import Image, ImageOps
 import streamlit as st
 
 st.set_page_config(page_title="Jeopardy!", page_icon="❓", layout="wide")
@@ -20,12 +23,41 @@ S = st.session_state
 # ----------------------------------------------------------------------------
 # Board data helpers
 # ----------------------------------------------------------------------------
+def blank_clue(q="", a=""):
+    # img = base64 data URL (optional photo), zoom = starting zoom level,
+    # fx/fy = focus point in %, ar = image aspect ratio (width / height)
+    return {"q": q, "a": a, "img": "", "zoom": 4.0, "fx": 50, "fy": 50, "ar": 1.5}
+
+
+def _num(value, default, lo, hi):
+    try:
+        return max(lo, min(hi, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def clean_clue(x):
+    return {
+        "q": str(x.get("q", "")),
+        "a": str(x.get("a", "")),
+        "img": str(x.get("img", "")),
+        "zoom": _num(x.get("zoom"), 4.0, 1.5, 12.0),
+        "fx": int(_num(x.get("fx"), 50, 0, 100)),
+        "fy": int(_num(x.get("fy"), 50, 0, 100)),
+        "ar": _num(x.get("ar"), 1.5, 0.2, 5.0),
+    }
+
+
+def has_content(clue):
+    return bool(clue["q"].strip() or clue.get("img"))
+
+
 def new_category(name="New category", rows=5, clues=None):
     clues = clues or [("", "")] * rows
     return {
         "id": uuid.uuid4().hex[:8],
         "name": name,
-        "clues": [{"q": q, "a": a} for q, a in clues],
+        "clues": [blank_clue(q, a) for q, a in clues],
     }
 
 
@@ -83,14 +115,13 @@ def normalize(b):
         cats.append({
             "id": c.get("id") or uuid.uuid4().hex[:8],
             "name": str(c.get("name", "")),
-            "clues": [{"q": str(x.get("q", "")), "a": str(x.get("a", ""))}
-                      for x in c.get("clues", [])],
+            "clues": [clean_clue(x) for x in c.get("clues", [])],
         })
     if not cats:
         cats = [new_category()]
     rows = max(MIN_ROWS, min(MAX_ROWS, max(len(c["clues"]) for c in cats)))
     for c in cats:
-        c["clues"] = (c["clues"][:rows] + [{"q": "", "a": ""} for _ in range(rows)])[:rows]
+        c["clues"] = (c["clues"][:rows] + [blank_clue() for _ in range(rows)])[:rows]
     return {"base": base, "categories": cats}
 
 
@@ -115,11 +146,49 @@ def esc(text):
     return html.escape(text).replace("\n", "<br>")
 
 
+def encode_image(data, max_side=1400):
+    """Shrink an uploaded photo and return (data URL, aspect ratio)."""
+    img = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
+    img.thumbnail((max_side, max_side))
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=85)
+    w, h = img.size
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode(), round(w / h, 4)
+
+
+def photo_html(clue, scale, reveal=False, maxh=520):
+    """A photo cropped by zooming in on the clue's focus point."""
+    src = clue.get("img", "")
+    if not src.startswith("data:image/"):
+        return ""
+    cls = "photo-img reveal" if reveal else "photo-img"
+    return (
+        f'<div class="photo-frame" style="--ar:{clue["ar"]};--maxh:{maxh}px">'
+        f'<img class="{cls}" src="{html.escape(src, quote=True)}" '
+        f'style="--z:{scale};transform-origin:{clue["fx"]}% {clue["fy"]}%"></div>'
+    )
+
+
+WIDGET_PREFIXES = ("catname_", "q_", "a_", "zoom_", "fx_", "fy_", "img_", "imgid_", "base_input")
+
+
+def clear_clue_keys(cid, r):
+    for k in list(S.keys()):
+        if isinstance(k, str) and (
+            k in (f"q_{cid}_{r}", f"a_{cid}_{r}", f"zoom_{cid}_{r}", f"fx_{cid}_{r}",
+                  f"fy_{cid}_{r}", f"imgid_{cid}_{r}")
+            or k.startswith(f"img_{cid}_{r}_")
+        ):
+            del S[k]
+    S.upl_ver.pop(f"{cid}_{r}", None)
+
+
 def set_board(new):
     """Replace the board and clear stale editor widget state."""
     for k in list(S.keys()):
-        if isinstance(k, str) and k.startswith(("catname_", "q_", "a_", "base_input")):
+        if isinstance(k, str) and k.startswith(WIDGET_PREFIXES):
             del S[k]
+    S.upl_ver = {}
     S.board = normalize(new)
 
 
@@ -136,6 +205,7 @@ def new_game():
     n_c, r = len(S.board["categories"]), n_rows()
     S.daily_double = (random.randrange(n_c), random.randrange(1, r) if r > 1 else 0)
     S.celebrated = False
+    S.zoom_step = 0
     S.game_snapshot = json.dumps(S.board, sort_keys=True)
 
 
@@ -143,6 +213,7 @@ if "board" not in S:
     S.board = load_board()
     S.team_names = ["Team 1", "Team 2", "Team 3", "Team 4"]
     S.num_teams = 2
+    S.upl_ver = {}
     new_game()
 
 
@@ -153,16 +224,22 @@ def pick(c, r):
     S.current = (c, r)
     S.show_answer = False
     S.wager = None
+    S.zoom_step = 0
 
 
 def reveal():
     S.show_answer = True
 
 
+def zoom_out():
+    S.zoom_step = min(3, S.zoom_step + 1)
+
+
 def cancel_clue():
     S.current = None
     S.show_answer = False
     S.wager = None
+    S.zoom_step = 0
 
 
 def resolve(team, correct):
@@ -181,12 +258,13 @@ def resolve(team, correct):
     S.current = None
     S.show_answer = False
     S.wager = None
+    S.zoom_step = 0
 
 
 def add_row():
     if n_rows() < MAX_ROWS:
         for c in S.board["categories"]:
-            c["clues"].append({"q": "", "a": ""})
+            c["clues"].append(blank_clue())
 
 
 def remove_row():
@@ -194,10 +272,7 @@ def remove_row():
         last = n_rows() - 1
         for c in S.board["categories"]:
             c["clues"].pop()
-            for prefix in ("q_", "a_"):
-                key = f"{prefix}{c['id']}_{last}"
-                if key in S:
-                    del S[key]
+            clear_clue_keys(c["id"], last)
 
 
 def add_category():
@@ -215,6 +290,16 @@ def move_category(i, step):
     j = i + step
     if 0 <= j < len(cats):
         cats[i], cats[j] = cats[j], cats[i]
+
+
+def remove_image(cid, r):
+    for cat in S.board["categories"]:
+        if cat["id"] == cid:
+            cat["clues"][r]["img"] = ""
+    key = f"{cid}_{r}"
+    S.upl_ver[key] = S.upl_ver.get(key, 0) + 1   # fresh, empty uploader
+    if f"imgid_{cid}_{r}" in S:
+        del S[f"imgid_{cid}_{r}"]
 
 
 def save_board():
@@ -372,6 +457,24 @@ st.markdown(
     .podium .pname { flex: 1; font-family: 'Oswald', sans-serif; font-size: 1.8rem; color: #fff; }
     .podium .pscore { font-family: 'Anton', Impact, sans-serif; font-size: 2.2rem; color: #ffcc33; }
 
+    /* photo clues */
+    .photo-frame {
+        width: 100%; max-width: calc(var(--maxh) * var(--ar)); aspect-ratio: var(--ar);
+        margin: 8px auto 18px; overflow: hidden; border-radius: 16px; background: #000;
+        border: 4px solid #050a38; box-shadow: 0 14px 40px rgba(0,0,0,.55), 0 0 0 3px rgba(255,204,51,.45);
+    }
+    .photo-img {
+        display: block; width: 100%; height: 100%; max-width: none;
+        transform: scale(var(--z)); transition: transform .6s ease;
+    }
+    .photo-img.reveal { animation: unzoom 1.6s ease-in-out forwards; }
+    @keyframes unzoom { from { transform: scale(var(--z)); } to { transform: scale(1); } }
+    .clue-caption {
+        text-align: center; margin: 6px 0; color: #fff; font-family: 'Oswald', sans-serif;
+        font-size: clamp(1.2rem, 2.2vw, 1.8rem); letter-spacing: .04em; text-transform: uppercase;
+        text-shadow: 2px 2px 0 rgba(0,0,0,.6);
+    }
+
     /* editor */
     .page-title {
         font-family: 'Anton', Impact, sans-serif; font-size: 2.6rem; letter-spacing: .1em;
@@ -431,7 +534,7 @@ with st.sidebar:
 def playable_set():
     return {(c, r)
             for c, cat in enumerate(S.board["categories"])
-            for r, clue in enumerate(cat["clues"]) if clue["q"].strip()}
+            for r, clue in enumerate(cat["clues"]) if has_content(clue)}
 
 
 def board_view():
@@ -449,7 +552,7 @@ def board_view():
         for r, v in enumerate(vals):
             cols = st.columns(len(cats))
             for c, cat in enumerate(cats):
-                gone = (c, r) in S.used or not cat["clues"][r]["q"].strip()
+                gone = (c, r) in S.used or not has_content(cat["clues"][r])
                 cols[c].button("\u00a0" if gone else f"${v:,}", key=f"tile_{c}_{r}",
                                disabled=gone, use_container_width=True,
                                on_click=pick, args=(c, r))
@@ -485,12 +588,26 @@ def clue_view():
         b2.button("↩ Back to board", use_container_width=True, on_click=cancel_clue)
         return
 
-    st.markdown(f'<div class="clue-card">{esc(clue["q"])}</div>', unsafe_allow_html=True)
+    has_img = bool(clue.get("img"))
+    if has_img:
+        z_cur = 1 + (clue["zoom"] - 1) * (1 - S.zoom_step / 3)
+        if clue["q"].strip():
+            st.markdown(f'<div class="clue-caption">{esc(clue["q"])}</div>', unsafe_allow_html=True)
+        st.markdown(photo_html(clue, round(z_cur, 3), reveal=S.show_answer), unsafe_allow_html=True)
+    else:
+        st.markdown(f'<div class="clue-card">{esc(clue["q"])}</div>', unsafe_allow_html=True)
 
     if not S.show_answer:
-        b1, b2 = st.columns([3, 1])
-        b1.button("👀 Reveal response", type="primary", use_container_width=True, on_click=reveal)
-        b2.button("↩ Back", use_container_width=True, on_click=cancel_clue)
+        if has_img:
+            b1, b2, b3 = st.columns([3, 1.6, 1])
+            b1.button("👀 Reveal response", type="primary", use_container_width=True, on_click=reveal)
+            b2.button("🔍 Zoom out a bit", use_container_width=True, on_click=zoom_out,
+                      disabled=S.zoom_step >= 3)
+            b3.button("↩ Back", use_container_width=True, on_click=cancel_clue)
+        else:
+            b1, b2 = st.columns([3, 1])
+            b1.button("👀 Reveal response", type="primary", use_container_width=True, on_click=reveal)
+            b2.button("↩ Back", use_container_width=True, on_click=cancel_clue)
         return
 
     st.markdown(f'<div class="answer-card">{esc(clue["a"] or "—")}</div>', unsafe_allow_html=True)
@@ -602,11 +719,40 @@ def edit_page():
                 cols = st.columns([0.9, 4, 2.4])
                 cols[0].markdown(f'<div class="value-chip">${vals[r]:,}</div>', unsafe_allow_html=True)
                 clue["q"] = cols[1].text_area("Clue", clue["q"], key=f"q_{cid}_{r}", height=80,
-                                              placeholder="The clue read out on the board…",
+                                              placeholder="The clue (optional if you add a photo)…",
                                               label_visibility="collapsed")
                 clue["a"] = cols[2].text_area("Response", clue["a"], key=f"a_{cid}_{r}", height=80,
                                               placeholder="What is …?",
                                               label_visibility="collapsed")
+
+                with st.expander("🖼️ Photo clue" + (" ✓" if clue.get("img") else "")):
+                    left, right = st.columns(2)
+                    ver = S.upl_ver.get(f"{cid}_{r}", 0)
+                    up = left.file_uploader("Upload a photo", type=["png", "jpg", "jpeg", "webp"],
+                                            key=f"img_{cid}_{r}_{ver}")
+                    if up is not None and S.get(f"imgid_{cid}_{r}") != up.file_id:
+                        S[f"imgid_{cid}_{r}"] = up.file_id
+                        try:
+                            clue["img"], clue["ar"] = encode_image(up.getvalue())
+                        except Exception:
+                            st.error("Couldn't read that image.")
+                    if clue.get("img"):
+                        clue["zoom"] = left.slider("Starting zoom", 1.5, 12.0, value=float(clue["zoom"]),
+                                                   step=0.5, key=f"zoom_{cid}_{r}")
+                        clue["fx"] = left.slider("Zoom spot: left ↔ right (%)", 0, 100, value=int(clue["fx"]),
+                                                 key=f"fx_{cid}_{r}")
+                        clue["fy"] = left.slider("Zoom spot: top ↕ bottom (%)", 0, 100, value=int(clue["fy"]),
+                                                 key=f"fy_{cid}_{r}")
+                        left.button("🗑️ Remove photo", key=f"rmimg_{cid}_{r}",
+                                    on_click=remove_image, args=(cid, r))
+                        right.caption("What players see first")
+                        right.markdown(photo_html(clue, clue["zoom"], maxh=200), unsafe_allow_html=True)
+                        right.caption("Full photo (shown on reveal)")
+                        right.markdown(photo_html(clue, 1.0, maxh=200), unsafe_allow_html=True)
+                    else:
+                        right.caption("Upload a photo, then pick how far to zoom in and which spot to focus on. "
+                                      "Players guess from the zoomed view; the host can zoom out in steps "
+                                      "or reveal the whole photo.")
 
 
 # ----------------------------------------------------------------------------
