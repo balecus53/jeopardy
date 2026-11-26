@@ -9,6 +9,7 @@ from pathlib import Path
 
 from PIL import Image, ImageOps
 import streamlit as st
+import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Jeopardy!", page_icon="❓", layout="wide")
 
@@ -50,6 +51,16 @@ def clean_clue(x):
 
 def has_content(clue):
     return bool(clue["q"].strip() or clue.get("img"))
+
+
+def clean_final(f):
+    f = f if isinstance(f, dict) else {}
+    return {
+        "enabled": bool(f.get("enabled", False)),
+        "category": str(f.get("category", "")),
+        "q": str(f.get("q", "")),
+        "a": str(f.get("a", "")),
+    }
 
 
 def new_category(name="New category", rows=5, clues=None):
@@ -101,6 +112,12 @@ def default_board():
                 ("This spicy fermented Korean cabbage dish is a staple side.", "What is kimchi?"),
             ]),
         ],
+        "final": {
+            "enabled": True,
+            "category": "World Capitals",
+            "q": "Located on the Danube, this capital was formed in 1873 by merging Buda, Pest and Óbuda.",
+            "a": "What is Budapest?",
+        },
     }
 
 
@@ -122,7 +139,7 @@ def normalize(b):
     rows = max(MIN_ROWS, min(MAX_ROWS, max(len(c["clues"]) for c in cats)))
     for c in cats:
         c["clues"] = (c["clues"][:rows] + [blank_clue() for _ in range(rows)])[:rows]
-    return {"base": base, "categories": cats}
+    return {"base": base, "categories": cats, "final": clean_final(b.get("final"))}
 
 
 def load_board():
@@ -169,7 +186,7 @@ def photo_html(clue, scale, reveal=False, maxh=520):
     )
 
 
-WIDGET_PREFIXES = ("catname_", "q_", "a_", "zoom_", "fx_", "fy_", "img_", "imgid_", "base_input")
+WIDGET_PREFIXES = ("final_", "catname_", "q_", "a_", "zoom_", "fx_", "fy_", "img_", "imgid_", "base_input")
 
 
 def clear_clue_keys(cid, r):
@@ -206,6 +223,11 @@ def new_game():
     S.daily_double = (random.randrange(n_c), random.randrange(1, r) if r > 1 else 0)
     S.celebrated = False
     S.zoom_step = 0
+    S.final_stage = "intro"      # intro -> wager -> clue -> reveal -> done
+    S.final_wagers = {}
+    for k in list(S.keys()):
+        if isinstance(k, str) and k.startswith(("fw_", "fr_")):
+            del S[k]
     S.game_snapshot = json.dumps(S.board, sort_keys=True)
 
 
@@ -292,6 +314,39 @@ def move_category(i, step):
         cats[i], cats[j] = cats[j], cats[i]
 
 
+def final_ok():
+    f = S.board["final"]
+    return f["enabled"] and f["q"].strip() != ""
+
+
+def eligible_teams():
+    """Only teams with a positive score can play Final Jeopardy."""
+    return [i for i in range(S.num_teams) if S.scores[i] > 0]
+
+
+def start_wagers():
+    S.final_stage = "wager"
+
+
+def lock_wagers():
+    S.final_wagers = {i: int(S.get(f"fw_{i}", 0) or 0) for i in eligible_teams()}
+    S.final_stage = "clue"
+
+
+def show_final_response():
+    S.final_stage = "reveal"
+
+
+def skip_final():
+    S.final_stage = "done"
+
+
+def finish_final():
+    for i, wager in S.final_wagers.items():
+        S.scores[i] += wager if S.get(f"fr_{i}") == "✅ Correct" else -wager
+    S.final_stage = "done"
+
+
 def remove_image(cid, r):
     for cat in S.board["categories"]:
         if cat["id"] == cid:
@@ -336,7 +391,7 @@ st.markdown(
     .stApp h1, .stApp h2, .stApp h3, .stApp h4,
     [data-testid="stWidgetLabel"] p, [data-testid="stRadio"] p,
     [data-testid="stCaptionContainer"], [data-testid="stExpander"] summary p,
-    [data-testid="stMetricLabel"] p { color: #fff !important; }
+    [data-testid="stMetricLabel"] p, [data-testid="stCheckbox"] p { color: #fff !important; }
 
     /* inputs: light fields, dark text */
     [data-baseweb="input"], [data-baseweb="textarea"], [data-baseweb="base-input"] {
@@ -638,6 +693,81 @@ def final_view():
         S.celebrated = True
 
 
+COUNTDOWN_HTML = """
+<div style="font-family:Impact,'Anton',sans-serif;text-align:center;color:#fff">
+  <div id="t" style="font-size:68px;color:#ffcc33;text-shadow:0 4px 0 #8a5a00">30</div>
+  <button id="b" onclick="go()" style="font-size:16px;padding:10px 22px;border-radius:10px;cursor:pointer;
+     border:1px solid #ffcc33;background:rgba(255,255,255,.1);color:#fff;font-weight:600">
+     ⏱️ Start 30-second timer</button>
+</div>
+<script>
+let n = 30, h = null;
+function go() {
+  if (h) return;
+  document.getElementById('b').style.display = 'none';
+  h = setInterval(() => {
+    n--;
+    const t = document.getElementById('t');
+    t.textContent = n;
+    if (n <= 10) t.style.color = '#ff6b6b';
+    if (n <= 0) { clearInterval(h); t.textContent = "TIME!"; }
+  }, 1000);
+}
+</script>
+"""
+
+
+def final_jeopardy_view():
+    fj = S.board["final"]
+    stage = S.final_stage
+    eligible = eligible_teams()
+    cat = esc(fj["category"].strip() or "Final Jeopardy")
+
+    st.markdown('<div class="brand">FINAL JEOPARDY!</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="clue-meta"><span>{cat}</span></div>', unsafe_allow_html=True)
+
+    if stage == "intro":
+        st.markdown(f'<div class="clue-card">{cat}</div>', unsafe_allow_html=True)
+        if not eligible:
+            st.warning("No team has a positive score, so nobody can play Final Jeopardy.")
+            st.button("See final results", type="primary", use_container_width=True, on_click=skip_final)
+        else:
+            names = ", ".join(S.team_names[i] for i in eligible)
+            st.markdown(f'<div class="clue-caption">Playing: {esc(names)}</div>', unsafe_allow_html=True)
+            st.button("✍️ Start wagering", type="primary", use_container_width=True, on_click=start_wagers)
+        return
+
+    if stage == "wager":
+        st.markdown(f'<div class="clue-card" style="min-height:160px">{cat}</div>', unsafe_allow_html=True)
+        st.caption("Each team wagers up to its score. Keep the screen hidden from other teams while they type!")
+        cols = st.columns(len(eligible))
+        for col, i in zip(cols, eligible):
+            col.number_input(f"{S.team_names[i]} (max ${S.scores[i]:,})", min_value=0,
+                             max_value=S.scores[i], value=0, step=100, key=f"fw_{i}")
+        st.button("🔒 Lock in wagers & show clue", type="primary", use_container_width=True,
+                  on_click=lock_wagers)
+        return
+
+    st.markdown(f'<div class="clue-card">{esc(fj["q"])}</div>', unsafe_allow_html=True)
+
+    if stage == "clue":
+        components.html(COUNTDOWN_HTML, height=130)
+        st.button("👀 Reveal response", type="primary", use_container_width=True,
+                  on_click=show_final_response)
+        return
+
+    # stage == "reveal"
+    st.markdown(f'<div class="answer-card">{esc(fj["a"] or "—")}</div>', unsafe_allow_html=True)
+    st.markdown("#### Who got it right?")
+    cols = st.columns(len(S.final_wagers))
+    for col, (i, wager) in zip(cols, S.final_wagers.items()):
+        col.radio(f"{S.team_names[i]} (wagered ${wager:,})", ["✅ Correct", "❌ Incorrect"],
+                  index=None, key=f"fr_{i}")
+    ready = all(S.get(f"fr_{i}") for i in S.final_wagers)
+    st.button("🏁 Finish game", type="primary", use_container_width=True,
+              disabled=not ready, on_click=finish_final)
+
+
 def play_page():
     if json.dumps(S.board, sort_keys=True) != S.game_snapshot:
         new_game()
@@ -653,7 +783,10 @@ def play_page():
     if S.current is not None:
         clue_view()
     elif playable <= S.used:
-        final_view()
+        if final_ok() and S.final_stage != "done":
+            final_jeopardy_view()
+        else:
+            final_view()
     else:
         board_view()
 
@@ -753,6 +886,17 @@ def edit_page():
                         right.caption("Upload a photo, then pick how far to zoom in and which spot to focus on. "
                                       "Players guess from the zoomed view; the host can zoom out in steps "
                                       "or reveal the whole photo.")
+
+    # --- Final Jeopardy ----------------------------------------------------
+    st.markdown("### 🏆 Final Jeopardy")
+    fj = S.board["final"]
+    with st.container(key="cat_final"):
+        fj["enabled"] = st.checkbox("Include a Final Jeopardy round", value=fj["enabled"], key="final_on")
+        fj["category"] = st.text_input("Final category", fj["category"], key="final_cat",
+                                       placeholder="Category")
+        fj["q"] = st.text_area("Final clue", fj["q"], key="final_q", height=90,
+                               placeholder="The final clue…")
+        fj["a"] = st.text_input("Final response", fj["a"], key="final_a", placeholder="What is …?")
 
 
 # ----------------------------------------------------------------------------
